@@ -2,12 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>Tennis 3D</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #0a0a2a; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
-  canvas { display: block; cursor: crosshair; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a2a; }
+  body { touch-action: none; -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+  canvas { display: block; width: 100%; height: 100%; }
 </style>
 </head>
 <body>
@@ -15,9 +16,20 @@
 <script>
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
-const W = 900, H = 600;
-canvas.width = W;
-canvas.height = H;
+
+// Dynamic resolution — always match actual screen pixels
+let W, H;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.round(window.innerWidth * dpr);
+  H = Math.round(window.innerHeight * dpr);
+  canvas.width = W;
+  canvas.height = H;
+  // Recalculate camera for new aspect
+  updateCamera();
+}
+
+const isMobile = /Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || ('ontouchstart' in window);
 
 // 3D world
 const COURT_W = 400;
@@ -25,8 +37,19 @@ const COURT_L = 700;
 const NET_Z = COURT_L / 2;
 const NET_H = 50;
 
-// Camera — behind and above the player
-const CAM = { x: 0, y: 160, z: -80, fov: 500 };
+// Camera — recalculated on resize
+let CAM = { x: 0, y: 160, z: -80, fov: 500 };
+
+function updateCamera() {
+  const aspect = W / H;
+  if (aspect < 1) {
+    // Portrait — pull camera higher and further back, wider fov
+    CAM = { x: 0, y: 220, z: -150, fov: 380 };
+  } else {
+    // Landscape
+    CAM = { x: 0, y: 160, z: -80, fov: 500 };
+  }
+}
 
 const BALL_R = 10;
 const MAX_MISSED = 5;
@@ -41,19 +64,37 @@ let gameTime = 0;
 let flash = 0;
 let shake = 0;
 
-// Mouse in screen coords
-let mouseX = W / 2;
-let mouseY = H / 2;
+let inputX = 0;
+let inputY = 0;
+let touching = false;
+let lastTouchTime = 0;
 
-// Racket state (3D position)
 let racket = { x: 0, y: 35, z: 60 };
 let swinging = false;
 let swingTarget = null;
 let swingTimer = 0;
-const SWING_DURATION = 0.15; // seconds to reach ball
+const SWING_DURATION = 0.15;
 
 let ball = null;
 let particles = [];
+
+// Scale factor for UI text
+function uiScale() {
+  const base = Math.min(W, H);
+  return Math.max(0.7, base / 600);
+}
+
+// ---- Helpers ----
+function getInputPos(e) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const rect = canvas.getBoundingClientRect();
+  const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+  const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+  return {
+    x: (clientX - rect.left) / rect.width * W,
+    y: (clientY - rect.top) / rect.height * H
+  };
+}
 
 // ---- 3D Projection ----
 function project(x, y, z) {
@@ -63,16 +104,10 @@ function project(x, y, z) {
   return { sx: W / 2 + (x - CAM.x) * s, sy: H / 2 - (y - CAM.y) * s, s };
 }
 
-// ---- Unproject screen click to 3D ground plane (y=0) ----
 function screenToGround(sx, sy) {
-  // Reverse of project at y=groundY
-  // We want to find (x, z) on y=groundY plane that projects to (sx, sy)
-  // sy = H/2 - (groundY - CAM.y) * (CAM.fov / (z - CAM.z))
-  // => (H/2 - sy) = (groundY - CAM.y) * CAM.fov / (z - CAM.z)
-  // We actually want the racket plane at some height, let's use racket.y
-  const ry = 35; // racket height
+  const ry = 35;
   const num = (ry - CAM.y) * CAM.fov;
-  const denom = -(sy - H / 2); // H/2 - sy
+  const denom = -(sy - H / 2);
   if (denom === 0) return null;
   const z = num / denom + CAM.z;
   if (z <= CAM.z) return null;
@@ -81,18 +116,16 @@ function screenToGround(sx, sy) {
   return { x, z };
 }
 
-// ---- Ball Creation ----
+// ---- Ball ----
 function createBall() {
   const speed = BASE_SPEED + score * SPEED_INC;
   const startX = (Math.random() - 0.5) * COURT_W * 0.6;
   const startZ = COURT_L - 30;
   const startY = 60;
 
-  // Target bounce point on player side
   const bounceX = (Math.random() - 0.5) * COURT_W * 0.6;
   const bounceZ = 60 + Math.random() * 100;
 
-  // Time to reach bounce point
   const dx = bounceX - startX;
   const dz = bounceZ - startZ;
   const dist = Math.sqrt(dx * dx + dz * dz);
@@ -100,9 +133,6 @@ function createBall() {
 
   const vx = dx / travelTime;
   const vz = dz / travelTime;
-  // Compute vy so that y=0 at t=travelTime
-  // y(t) = startY + vy*t - 0.5*g*t^2 = 0
-  // vy = (0.5*g*t^2 - startY) / t
   const g = 400;
   const vy = (0.5 * g * travelTime * travelTime - startY) / travelTime;
 
@@ -117,16 +147,13 @@ function createBall() {
 function trySwing() {
   if (!ball || !ball.alive || ball.hit) return;
 
-  // Calculate where the ball will be soon (predict ~0.2s ahead or current pos)
   const predictT = 0.15;
   const bx = ball.x + ball.vx * predictT;
   const by = Math.max(0, ball.y + ball.vy * predictT - 0.5 * 400 * predictT * predictT);
   const bz = ball.z + ball.vz * predictT;
 
-  // Only allow swing if ball is on player's side and within reach
   if (bz > NET_Z || bz < -20) return;
 
-  // Set swing target
   swinging = true;
   swingTarget = { x: bx, y: Math.max(20, by), z: bz };
   swingTimer = 0;
@@ -145,7 +172,6 @@ function performHit() {
     score++;
     flash = 0.3;
 
-    // Send ball back over the net
     const targetX = (Math.random() - 0.5) * COURT_W * 0.5;
     const targetZ = COURT_L + 50;
     const returnSpeed = ball.speed * 1.1;
@@ -158,7 +184,6 @@ function performHit() {
     ball.vz = rdz / rt;
     ball.vy = 150 + Math.random() * 80;
 
-    // Hit particles
     for (let i = 0; i < 18; i++) {
       const a = Math.random() * Math.PI * 2;
       const sp = 50 + Math.random() * 150;
@@ -202,8 +227,7 @@ function update(dt) {
   if (flash > 0) flash -= dt;
   if (shake > 0) shake -= dt * 3;
 
-  // Racket follows mouse (map screen to 3D)
-  const ground = screenToGround(mouseX, mouseY);
+  const ground = screenToGround(inputX, inputY);
   if (ground && !swinging) {
     const tx = Math.max(-COURT_W / 2 + 20, Math.min(COURT_W / 2 - 20, ground.x));
     const tz = Math.max(20, Math.min(NET_Z - 30, ground.z));
@@ -211,19 +235,15 @@ function update(dt) {
     racket.z += (tz - racket.z) * Math.min(1, dt * 12);
   }
 
-  // Swing animation
   if (swinging && swingTarget) {
     swingTimer += dt;
     const t = Math.min(1, swingTimer / SWING_DURATION);
-    // Ease out
     const ease = 1 - (1 - t) * (1 - t);
     racket.x += (swingTarget.x - racket.x) * ease * 0.5;
     racket.y += (swingTarget.y - racket.y) * ease * 0.5;
     racket.z += (swingTarget.z - racket.z) * ease * 0.5;
 
-    if (t >= 0.3) {
-      performHit();
-    }
+    if (t >= 0.3) performHit();
     if (t >= 1) {
       swinging = false;
       swingTarget = null;
@@ -233,14 +253,12 @@ function update(dt) {
     racket.y += (35 - racket.y) * Math.min(1, dt * 8);
   }
 
-  // Ball physics
   if (ball && ball.alive) {
     ball.x += ball.vx * dt;
     ball.y += ball.vy * dt;
     ball.z += ball.vz * dt;
     ball.vy -= 400 * dt;
 
-    // Ground bounce
     if (ball.y <= 0) {
       ball.y = 0;
       if (!ball.hit && ball.z < NET_Z && ball.z > -10) {
@@ -248,7 +266,6 @@ function update(dt) {
         if (ball.bounces >= 2) {
           ball.alive = false;
           missedBall();
-          // Miss particles
           for (let i = 0; i < 8; i++) {
             const a = Math.random() * Math.PI * 2;
             const sp = 20 + Math.random() * 60;
@@ -259,11 +276,9 @@ function update(dt) {
             });
           }
         } else {
-          // First bounce — go up
           ball.vy = Math.max(120, Math.abs(ball.vy) * 0.6);
           ball.vz *= 0.3;
           ball.vx *= 0.7;
-          // Bounce particles
           for (let i = 0; i < 5; i++) {
             const a = Math.random() * Math.PI * 2;
             particles.push({
@@ -277,26 +292,21 @@ function update(dt) {
         ball.vy = Math.abs(ball.vy) * 0.35;
         if (ball.vy < 15) ball.alive = false;
       } else {
-        // Bounced on far side or something weird
         ball.vy = Math.abs(ball.vy) * 0.3;
         if (ball.vy < 10) { ball.alive = false; missedBall(); }
       }
     }
 
-    // Out of court
     if (ball.z > COURT_L + 80) ball.alive = false;
     if (ball.z < -80 && !ball.hit) { ball.alive = false; missedBall(); }
     if (Math.abs(ball.x) > COURT_W && !ball.hit) { ball.alive = false; missedBall(); }
   }
 
-  // New ball if needed
   if (ball && !ball.alive && ball.hit) {
-    const ref = ball;
     ball = null;
     setTimeout(() => { if (state === 'playing' && !ball) createBall(); }, 600);
   }
 
-  // Particles
   for (const p of particles) {
     p.x += p.vx * dt;
     p.y += p.vy * dt;
@@ -314,7 +324,6 @@ function drawCourt() {
   ctx.save();
   ctx.translate(sx, sy);
 
-  // Court floor
   const c = [
     project(-COURT_W / 2, 0, 0), project(COURT_W / 2, 0, 0),
     project(COURT_W / 2, 0, COURT_L), project(-COURT_W / 2, 0, COURT_L)
@@ -331,7 +340,6 @@ function drawCourt() {
     ctx.stroke();
   }
 
-  // Lines
   const lines = [
     [0, 0, 0, COURT_L],
     [-COURT_W / 2, COURT_L * 0.25, COURT_W / 2, COURT_L * 0.25],
@@ -345,7 +353,6 @@ function drawCourt() {
     }
   }
 
-  // Net
   const np = [
     project(-COURT_W / 2 - 15, 0, NET_Z), project(-COURT_W / 2 - 15, NET_H, NET_Z),
     project(COURT_W / 2 + 15, NET_H, NET_Z), project(COURT_W / 2 + 15, 0, NET_Z)
@@ -361,7 +368,6 @@ function drawCourt() {
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // Horizontal net lines
     for (let i = 1; i <= 3; i++) {
       const ly = NET_H * i / 4;
       const a = project(-COURT_W / 2 - 15, ly, NET_Z);
@@ -371,7 +377,6 @@ function drawCourt() {
         ctx.strokeStyle = '#fff2'; ctx.lineWidth = 1; ctx.stroke();
       }
     }
-    // Vertical net lines
     for (let i = 1; i <= 7; i++) {
       const lx = -COURT_W / 2 - 15 + (COURT_W + 30) * i / 8;
       const a = project(lx, 0, NET_Z), b = project(lx, NET_H, NET_Z);
@@ -380,7 +385,6 @@ function drawCourt() {
         ctx.strokeStyle = '#fff1'; ctx.lineWidth = 1; ctx.stroke();
       }
     }
-    // Posts
     for (const px of [-COURT_W / 2 - 15, COURT_W / 2 + 15]) {
       const a = project(px, 0, NET_Z), b = project(px, NET_H + 5, NET_Z);
       if (a && b) {
@@ -395,9 +399,8 @@ function drawCourt() {
 function drawBall3D(bx, by, bz, color) {
   const p = project(bx, by, bz);
   if (!p) return;
-  const r = Math.max(2, BALL_R * p.s);
+  const r = Math.max(3, BALL_R * p.s);
 
-  // Shadow
   const sp = project(bx, 0, bz);
   if (sp) {
     const sr = Math.max(1, BALL_R * 0.6 * sp.s);
@@ -415,7 +418,6 @@ function drawBall3D(bx, by, bz, color) {
   ctx.fill();
   ctx.shadowBlur = 0;
 
-  // Highlight
   ctx.beginPath();
   ctx.arc(p.sx - r * 0.25, p.sy - r * 0.25, r * 0.3, 0, Math.PI * 2);
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
@@ -426,24 +428,18 @@ function drawRacket() {
   const p = project(racket.x, racket.y, racket.z);
   if (!p) return;
 
-  // Oval head
   const rw = 32 * p.s;
   const rh = 42 * p.s;
-
   const headCY = p.sy;
-
-  // Glow when swinging
   const glowAlpha = swinging ? 0.5 : 0.15;
-  const glowSize = swinging ? rw * 1.8 : 0;
 
   if (swinging) {
     ctx.beginPath();
     ctx.ellipse(p.sx, headCY, rw * 1.5, rh * 1.5, 0, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(0, 200, 255, 0.1)`;
+    ctx.fillStyle = 'rgba(0, 200, 255, 0.1)';
     ctx.fill();
   }
 
-  // Racket frame (oval)
   ctx.beginPath();
   ctx.ellipse(p.sx, headCY, rw, rh, 0, 0, Math.PI * 2);
   ctx.fillStyle = `rgba(0, 200, 255, ${glowAlpha})`;
@@ -455,65 +451,47 @@ function drawRacket() {
   ctx.stroke();
   ctx.shadowBlur = 0;
 
-  // Strings — horizontal
   for (let i = -2; i <= 2; i++) {
     const ly = headCY + i * rh * 0.35;
-    // Clip to ellipse width at this y
     const frac = i * 0.35;
     const clipW = rw * Math.sqrt(Math.max(0, 1 - frac * frac));
-    ctx.beginPath();
-    ctx.moveTo(p.sx - clipW, ly);
-    ctx.lineTo(p.sx + clipW, ly);
-    ctx.strokeStyle = '#00ccff44';
-    ctx.lineWidth = Math.max(0.5, 1 * p.s);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(p.sx - clipW, ly); ctx.lineTo(p.sx + clipW, ly);
+    ctx.strokeStyle = '#00ccff44'; ctx.lineWidth = Math.max(0.5, 1 * p.s); ctx.stroke();
   }
-  // Strings — vertical
   for (let i = -2; i <= 2; i++) {
     const lx = p.sx + i * rw * 0.35;
     const frac = i * 0.35;
     const clipH = rh * Math.sqrt(Math.max(0, 1 - frac * frac));
-    ctx.beginPath();
-    ctx.moveTo(lx, headCY - clipH);
-    ctx.lineTo(lx, headCY + clipH);
-    ctx.strokeStyle = '#00ccff44';
-    ctx.lineWidth = Math.max(0.5, 1 * p.s);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(lx, headCY - clipH); ctx.lineTo(lx, headCY + clipH);
+    ctx.strokeStyle = '#00ccff44'; ctx.lineWidth = Math.max(0.5, 1 * p.s); ctx.stroke();
   }
 
-  // Handle
   const handleLen = 28 * p.s;
-  ctx.beginPath();
-  ctx.moveTo(p.sx, headCY + rh);
-  ctx.lineTo(p.sx, headCY + rh + handleLen);
-  ctx.strokeStyle = '#b8773d';
-  ctx.lineWidth = Math.max(2, 4 * p.s);
-  ctx.stroke();
-  // Grip
-  ctx.beginPath();
-  ctx.moveTo(p.sx, headCY + rh + handleLen * 0.4);
-  ctx.lineTo(p.sx, headCY + rh + handleLen);
-  ctx.strokeStyle = '#2a2a4a';
-  ctx.lineWidth = Math.max(3, 5 * p.s);
-  ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(p.sx, headCY + rh); ctx.lineTo(p.sx, headCY + rh + handleLen);
+  ctx.strokeStyle = '#b8773d'; ctx.lineWidth = Math.max(2, 4 * p.s); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(p.sx, headCY + rh + handleLen * 0.4); ctx.lineTo(p.sx, headCY + rh + handleLen);
+  ctx.strokeStyle = '#2a2a4a'; ctx.lineWidth = Math.max(3, 5 * p.s); ctx.stroke();
 }
 
 function drawHUD() {
+  const s = uiScale();
+
   ctx.fillStyle = '#00ffaa';
-  ctx.font = 'bold 28px monospace';
+  ctx.font = `bold ${Math.round(26 * s)}px monospace`;
   ctx.textAlign = 'left';
-  ctx.fillText(`SCORE: ${score}`, 20, 35);
+  ctx.fillText(`SCORE: ${score}`, 16 * s, 32 * s);
 
   const spd = BASE_SPEED + score * SPEED_INC;
   ctx.fillStyle = '#888';
-  ctx.font = '14px monospace';
-  ctx.fillText(`Speed: ${spd}`, 20, 55);
+  ctx.font = `${Math.round(13 * s)}px monospace`;
+  ctx.fillText(`Speed: ${spd}`, 16 * s, 52 * s);
 
-  // Missed indicators
+  const dotR = 9 * s;
+  const dotGap = 26 * s;
   for (let i = 0; i < MAX_MISSED; i++) {
-    const bx = W - 30 - i * 30;
+    const bx = W - 24 * s - i * dotGap;
     ctx.beginPath();
-    ctx.arc(bx, 28, 10, 0, Math.PI * 2);
+    ctx.arc(bx, 26 * s, dotR, 0, Math.PI * 2);
     ctx.fillStyle = i < missed ? '#ff3333' : '#333';
     ctx.fill();
     ctx.strokeStyle = i < missed ? '#ff6666' : '#666';
@@ -521,17 +499,15 @@ function drawHUD() {
     ctx.stroke();
   }
   ctx.fillStyle = '#aaa';
-  ctx.font = '14px monospace';
+  ctx.font = `${Math.round(12 * s)}px monospace`;
   ctx.textAlign = 'right';
-  ctx.fillText('MISSES', W - 30 - (MAX_MISSED - 1) * 30 - 15, 50);
+  ctx.fillText('MISSES', W - 24 * s - (MAX_MISSED - 1) * dotGap - 12, 48 * s);
   ctx.textAlign = 'left';
 }
 
 function drawLandingIndicator() {
   if (!ball || !ball.alive || ball.hit) return;
 
-  // Predict where ball will land (y=0)
-  // y(t) = ball.y + ball.vy*t - 0.5*400*t^2 = 0
   const a = -200, b = ball.vy, c = ball.y;
   const disc = b * b - 4 * a * c;
   if (disc < 0) return;
@@ -540,12 +516,11 @@ function drawLandingIndicator() {
 
   const landX = ball.x + ball.vx * t;
   const landZ = ball.z + ball.vz * t;
-
   if (landZ < -20 || landZ > NET_Z + 20) return;
 
   const lp = project(landX, 1, landZ);
   if (!lp) return;
-  const r = Math.max(4, 22 * lp.s);
+  const r = Math.max(5, 22 * lp.s);
   const pulse = 0.5 + Math.sin(gameTime * 10) * 0.3;
 
   ctx.beginPath();
@@ -553,7 +528,6 @@ function drawLandingIndicator() {
   ctx.strokeStyle = `rgba(255, 80, 80, ${pulse})`;
   ctx.lineWidth = 2;
   ctx.stroke();
-
   ctx.beginPath();
   ctx.ellipse(lp.sx, lp.sy, r * 0.4, r * 0.15, 0, 0, Math.PI * 2);
   ctx.fillStyle = `rgba(255, 80, 80, ${pulse * 0.5})`;
@@ -564,20 +538,30 @@ function draw() {
   ctx.fillStyle = '#0a0a2a';
   ctx.fillRect(0, 0, W, H);
 
+  const s = uiScale();
+
   if (state === 'start') {
     drawCourt();
-    ctx.fillStyle = '#00ffaa';
-    ctx.font = 'bold 44px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('TENNIS 3D', W / 2, H / 2 - 70);
-    ctx.font = '17px monospace';
+
+    ctx.fillStyle = '#00ffaa';
+    ctx.font = `bold ${Math.round(40 * s)}px monospace`;
+    ctx.fillText('TENNIS 3D', W / 2, H * 0.32);
+
+    ctx.font = `${Math.round(16 * s)}px monospace`;
     ctx.fillStyle = '#aaa';
-    ctx.fillText('Move mouse on the court', W / 2, H / 2 - 15);
-    ctx.fillText('Click to swing and return the ball!', W / 2, H / 2 + 15);
-    ctx.fillText(`Miss ${MAX_MISSED} balls and it's game over`, W / 2, H / 2 + 45);
+    if (isMobile) {
+      ctx.fillText('Drag finger to move racket', W / 2, H * 0.32 + 40 * s);
+      ctx.fillText('Tap to swing!', W / 2, H * 0.32 + 68 * s);
+    } else {
+      ctx.fillText('Move mouse on the court', W / 2, H * 0.32 + 40 * s);
+      ctx.fillText('Click to swing!', W / 2, H * 0.32 + 68 * s);
+    }
+    ctx.fillText(`Miss ${MAX_MISSED} balls = game over`, W / 2, H * 0.32 + 96 * s);
+
     ctx.fillStyle = '#ffaa00';
-    ctx.font = 'bold 24px monospace';
-    ctx.fillText('CLICK TO START', W / 2, H / 2 + 95);
+    ctx.font = `bold ${Math.round(22 * s)}px monospace`;
+    ctx.fillText(isMobile ? 'TAP TO START' : 'CLICK TO START', W / 2, H * 0.32 + 145 * s);
     ctx.textAlign = 'left';
     return;
   }
@@ -590,7 +574,6 @@ function draw() {
   drawCourt();
   drawLandingIndicator();
 
-  // Particles (behind ball)
   for (const p of particles) {
     const pp = project(p.x, p.y, p.z);
     if (!pp) continue;
@@ -599,7 +582,6 @@ function draw() {
     ctx.fillRect(pp.sx - size / 2, pp.sy - size / 2, size, size);
   }
 
-  // Ball
   if (ball && ball.alive) {
     const color = ball.hit ? '#00ff88' : '#ffee00';
     drawBall3D(ball.x, ball.y, ball.z, color);
@@ -608,22 +590,36 @@ function draw() {
   drawRacket();
   drawHUD();
 
+  // Mobile touch hint
+  if (isMobile && gameTime < 5) {
+    const alpha = Math.max(0, 1 - gameTime / 5);
+    ctx.fillStyle = `rgba(255,255,255,${alpha * 0.2})`;
+    ctx.font = `${Math.round(13 * s)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('Drag to move \u2022 Tap to swing', W / 2, H - 16 * s);
+    ctx.textAlign = 'left';
+  }
+
   if (state === 'over') {
     ctx.fillStyle = 'rgba(0,0,0,0.75)';
     ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = '#ff3333';
-    ctx.font = 'bold 50px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('GAME OVER', W / 2, H / 2 - 50);
+
+    ctx.fillStyle = '#ff3333';
+    ctx.font = `bold ${Math.round(46 * s)}px monospace`;
+    ctx.fillText('GAME OVER', W / 2, H * 0.38);
+
     ctx.fillStyle = '#fff';
-    ctx.font = '30px monospace';
-    ctx.fillText(`Score: ${score}`, W / 2, H / 2 + 5);
+    ctx.font = `${Math.round(28 * s)}px monospace`;
+    ctx.fillText(`Score: ${score}`, W / 2, H * 0.38 + 50 * s);
+
     ctx.fillStyle = '#888';
-    ctx.font = '18px monospace';
-    ctx.fillText(`Ball speed: ${BASE_SPEED + score * SPEED_INC}`, W / 2, H / 2 + 40);
+    ctx.font = `${Math.round(16 * s)}px monospace`;
+    ctx.fillText(`Ball speed: ${BASE_SPEED + score * SPEED_INC}`, W / 2, H * 0.38 + 85 * s);
+
     ctx.fillStyle = '#ffaa00';
-    ctx.font = 'bold 22px monospace';
-    ctx.fillText('CLICK TO RESTART', W / 2, H / 2 + 90);
+    ctx.font = `bold ${Math.round(22 * s)}px monospace`;
+    ctx.fillText(isMobile ? 'TAP TO RESTART' : 'CLICK TO RESTART', W / 2, H * 0.38 + 135 * s);
     ctx.textAlign = 'left';
   }
 }
@@ -636,18 +632,60 @@ function gameLoop(now) {
   requestAnimationFrame(gameLoop);
 }
 
-// ---- Input ----
+// ---- Input: Mouse ----
 canvas.addEventListener('mousemove', e => {
-  const rect = canvas.getBoundingClientRect();
-  mouseX = (e.clientX - rect.left) / rect.width * W;
-  mouseY = (e.clientY - rect.top) / rect.height * H;
+  if (isMobile) return;
+  const p = getInputPos(e);
+  inputX = p.x;
+  inputY = p.y;
 });
 
-canvas.addEventListener('click', () => {
+canvas.addEventListener('click', e => {
+  if (isMobile) return;
   if (state === 'start' || state === 'over') { startGame(); return; }
   if (state === 'playing') trySwing();
 });
 
+// ---- Input: Touch ----
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (state === 'start' || state === 'over') { startGame(); return; }
+
+  touching = true;
+  const p = getInputPos(e);
+  inputX = p.x;
+  inputY = p.y;
+  lastTouchTime = performance.now();
+}, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (!touching) return;
+  const p = getInputPos(e);
+  inputX = p.x;
+  inputY = p.y;
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  if (!touching) return;
+  touching = false;
+
+  const dt = performance.now() - lastTouchTime;
+  if (dt < 300 && state === 'playing') {
+    trySwing();
+  }
+}, { passive: false });
+
+document.addEventListener('gesturestart', e => e.preventDefault());
+document.addEventListener('gesturechange', e => e.preventDefault());
+document.addEventListener('gestureend', e => e.preventDefault());
+
+// Init
+resize();
+window.addEventListener('resize', resize);
+inputX = W / 2;
+inputY = H * 0.75;
 lastTime = performance.now();
 requestAnimationFrame(gameLoop);
 </script>

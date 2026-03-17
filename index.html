@@ -37,17 +37,20 @@ const COURT_L = 700;
 const NET_Z = COURT_L / 2;
 const NET_H = 50;
 
-// Camera — recalculated on resize
+// Camera — recalculated on resize to guarantee full court visibility
 let CAM = { x: 0, y: 160, z: -80, fov: 500 };
 
 function updateCamera() {
   const aspect = W / H;
-  if (aspect < 1) {
-    // Portrait — pull camera higher and further back, wider fov
-    CAM = { x: 0, y: 220, z: -150, fov: 380 };
+  if (aspect < 0.7) {
+    // Tall portrait (phones) — top-down, see entire player court
+    CAM = { x: 0, y: 550, z: -180, fov: 200, screenOffsetY: -H * 0.15 };
+  } else if (aspect < 1) {
+    // Square-ish portrait (tablets)
+    CAM = { x: 0, y: 400, z: -160, fov: 280, screenOffsetY: -H * 0.1 };
   } else {
     // Landscape
-    CAM = { x: 0, y: 160, z: -80, fov: 500 };
+    CAM = { x: 0, y: 160, z: -80, fov: 500, screenOffsetY: 0 };
   }
 }
 
@@ -101,13 +104,15 @@ function project(x, y, z) {
   const dz = z - CAM.z;
   if (dz <= 1) return null;
   const s = CAM.fov / dz;
-  return { sx: W / 2 + (x - CAM.x) * s, sy: H / 2 - (y - CAM.y) * s, s };
+  const oY = CAM.screenOffsetY || 0;
+  return { sx: W / 2 + (x - CAM.x) * s, sy: H / 2 + oY - (y - CAM.y) * s, s };
 }
 
 function screenToGround(sx, sy) {
   const ry = 35;
+  const oY = CAM.screenOffsetY || 0;
   const num = (ry - CAM.y) * CAM.fov;
-  const denom = -(sy - H / 2);
+  const denom = -(sy - H / 2 - oY);
   if (denom === 0) return null;
   const z = num / denom + CAM.z;
   if (z <= CAM.z) return null;
